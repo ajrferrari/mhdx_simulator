@@ -7,6 +7,7 @@ from molmass import Formula
 
 import json
 
+from dataclasses import dataclass
 
 # ==== constants ====
 PROTON_MASS   = 1.00727646688     # Da
@@ -757,3 +758,272 @@ class HDXTimecourseEngine:
             prof[prof < self.min_profile_intensity] = 0.0
             profs[ti] = prof
         return dt_g, profs
+
+
+
+@dataclass
+class TensorComponent:
+    """
+    A single (T,R,D,M) tensor with its axis labels and an optional weight.
+
+    Attributes
+    ----------
+    name : str
+    tensor : np.ndarray  # shape (T,R,D,M)
+    t_labels : np.ndarray  # shape (T,)   (timepoints)
+    rt_labels : np.ndarray # shape (R,)   (minutes)
+    dt_labels : np.ndarray # shape (D,)   (milliseconds)
+    mz_labels : np.ndarray # shape (M,)   (m/z)
+    weight : float        # multiplicative factor when summing
+    """
+    name: str
+    tensor: np.ndarray
+    t_labels: np.ndarray
+    rt_labels: np.ndarray
+    dt_labels: np.ndarray
+    mz_labels: np.ndarray
+    weight: float = 1.0
+
+    def validate(self) -> None:
+        t, r, d, m = self.tensor.shape
+        if t != self.t_labels.size:
+            raise ValueError(f"{self.name}: T mismatch ({t} vs {self.t_labels.size})")
+        if r != self.rt_labels.size:
+            raise ValueError(f"{self.name}: R mismatch ({r} vs {self.rt_labels.size})")
+        if d != self.dt_labels.size:
+            raise ValueError(f"{self.name}: D mismatch ({d} vs {self.dt_labels.size})")
+        if m != self.mz_labels.size:
+            raise ValueError(f"{self.name}: M mismatch ({m} vs {self.mz_labels.size})")
+        # Monotonic check (ascending); required for union/searchsorted semantics
+        for lbl, nm in [(self.t_labels, "t_labels"),
+                        (self.rt_labels, "rt_labels"),
+                        (self.dt_labels, "dt_labels"),
+                        (self.mz_labels, "mz_labels")]:
+            if np.any(np.diff(lbl) < 0):
+                raise ValueError(f"{self.name}: {nm} must be sorted ascending.")
+
+
+class TensorCombiner:
+    """
+    Sum multiple HDX tensors onto a unified (T,RT,DT,M) grid (set union of labels).
+    Overlap is handled by exact label matching (no interpolation).
+
+    Usage
+    -----
+    comb = TensorCombiner(dtype=np.float32)
+    comb.add_component(TensorComponent(...))
+    comb.add_component(TensorComponent(...))
+    final = comb.combine()              # returns (final_tensor, t, rt, dt, mz)
+    noisy = comb.add_uniform_noise(low=0, high=30)      # returns noisy copy
+    # or:
+    noisy = comb.add_poisson_noise(scale=1.0)
+    """
+
+    def __init__(self, *, dtype=np.float32) -> None:
+        self.components: List[TensorComponent] = []
+        self.dtype = dtype
+
+        # union axes (filled after ._build_union_axes())
+        self.t_labels: Optional[np.ndarray] = None
+        self.rt_labels: Optional[np.ndarray] = None
+        self.dt_labels: Optional[np.ndarray] = None
+        self.mz_labels: Optional[np.ndarray] = None
+
+        # last results
+        self.final_tensor: Optional[np.ndarray] = None
+
+    # ---------------- public API ----------------
+
+    def add_component(self, comp: TensorComponent) -> "TensorCombiner":
+        comp.validate()
+        self.components.append(comp)
+        return self
+
+    def add_from_engine(self, engine, name: str, tensor_attr: str = "perturbed_tensor", weight: float = 1.0) -> "TensorCombiner":
+        """
+        Convenience: add a component directly from an engine that stores
+        .timepoints, .rt_labels, .dt_labels, .mz_labels and a tensor attribute.
+        """
+        tensor = getattr(engine, tensor_attr, None)
+        if tensor is None:
+            raise ValueError(f"Engine has no tensor '{tensor_attr}' to add.")
+        comp = TensorComponent(
+            name=name,
+            tensor=np.asarray(tensor),
+            t_labels=np.asarray(engine.timepoints),
+            rt_labels=np.asarray(engine.rt_labels),
+            dt_labels=np.asarray(engine.dt_labels),
+            mz_labels=np.asarray(engine.mz_labels),
+            weight=float(weight),
+        )
+        return self.add_component(comp)
+
+    def combine(
+        self,
+        *,
+        t_union: Optional[np.ndarray] = None,
+        rt_union: Optional[np.ndarray] = None,
+        dt_union: Optional[np.ndarray] = None,
+        mz_union: Optional[np.ndarray] = None,
+        clip_min: Optional[float] = 0.0,
+        return_axes: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | np.ndarray:
+        """
+        Sum all components onto a unified grid. If any *_union is provided,
+        it is used; otherwise the set-union (sorted unique) across components.
+
+        Parameters
+        ----------
+        *_union : Optional[np.ndarray]
+            Pre-defined union axes. If None, computed by union of component labels.
+        clip_min : float or None
+            If not None, clip output to be >= clip_min (default 0).
+        return_axes : bool
+            If True, return (tensor, t, rt, dt, mz); else just the tensor.
+
+        Returns
+        -------
+        Either:
+          final_tensor : np.ndarray
+        or
+          (final_tensor, t_labels, rt_labels, dt_labels, mz_labels)
+        """
+        if not self.components:
+            raise ValueError("No components added.")
+
+        # 1) Build union axes
+        self._build_union_axes(t_union, rt_union, dt_union, mz_union)
+
+        T = self.t_labels.size
+        R = self.rt_labels.size
+        D = self.dt_labels.size
+        M = self.mz_labels.size
+
+        # 2) Allocate canvas
+        out = np.zeros((T, R, D, M), dtype=self.dtype)
+
+        # 3) Precompute index maps for each component
+        for comp in self.components:
+            t_idx = self._index_map(self.t_labels, comp.t_labels, axis_name=f"{comp.name}.t_labels")
+            r_idx = self._index_map(self.rt_labels, comp.rt_labels, axis_name=f"{comp.name}.rt_labels")
+            d_idx = self._index_map(self.dt_labels, comp.dt_labels, axis_name=f"{comp.name}.dt_labels")
+            m_idx = self._index_map(self.mz_labels, comp.mz_labels, axis_name=f"{comp.name}.mz_labels")
+
+            # 4) Scatter-add via advanced indexing
+            # out[np.ix_(t_idx, r_idx, d_idx, m_idx)] += weight * comp.tensor
+            # For memory efficiency, iterate over timepoints:
+            w = float(comp.weight)
+            tens = comp.tensor
+            for k_local, k_global in enumerate(t_idx):
+                out[k_global][np.ix_(r_idx, d_idx, m_idx)] += w * tens[k_local]
+
+        if clip_min is not None:
+            np.maximum(out, clip_min, out)
+
+        self.final_tensor = out
+        if return_axes:
+            return out, self.t_labels, self.rt_labels, self.dt_labels, self.mz_labels
+        return out
+
+    # ---------------- noise helpers ----------------
+
+    def add_uniform_noise(
+        self,
+        *,
+        low: int = 0,
+        high: int = 30,
+        rng: Optional[np.random.Generator] = None,
+        clip_min: Optional[float] = 0.0,
+        return_noise: bool = False,
+        target: Optional[np.ndarray] = None,
+        dtype: Optional[np.dtype] = None,
+    ) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
+        """
+        Add integer Uniform{low..high} noise to `target` tensor (or to last final_tensor if None).
+        """
+        if target is None:
+            if self.final_tensor is None:
+                raise RuntimeError("No target tensor provided and no final_tensor available. Call combine() first.")
+            target = self.final_tensor
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        noise = rng.integers(low, high + 1, size=target.shape, dtype=np.int16)
+        out_dtype = dtype or np.result_type(target.dtype, np.float32)
+        noisy = target.astype(out_dtype, copy=True)
+        noisy += noise
+        if clip_min is not None:
+            np.maximum(noisy, clip_min, noisy)
+        return (noisy, noise) if return_noise else noisy
+
+    def add_poisson_noise(
+        self,
+        *,
+        scale: float = 1.0,
+        rng: Optional[np.random.Generator] = None,
+        target: Optional[np.ndarray] = None,
+        dtype: Optional[np.dtype] = None,
+    ) -> np.ndarray:
+        """
+        Add Poisson noise with lambda = scale * target (elementwise).
+        """
+        if target is None:
+            if self.final_tensor is None:
+                raise RuntimeError("No target tensor provided and no final_tensor available. Call combine() first.")
+            target = self.final_tensor
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        lam = np.maximum(scale * target, 0.0)
+        noisy = rng.poisson(lam=lam).astype(dtype or np.result_type(target.dtype, np.int32), copy=False)
+        return noisy
+
+    # ---------------- internals ----------------
+
+    def _build_union_axes(
+        self,
+        t_union: Optional[np.ndarray],
+        rt_union: Optional[np.ndarray],
+        dt_union: Optional[np.ndarray],
+        mz_union: Optional[np.ndarray],
+    ) -> None:
+        if t_union is None:
+            t_union = self._sorted_union([c.t_labels for c in self.components])
+        if rt_union is None:
+            rt_union = self._sorted_union([c.rt_labels for c in self.components])
+        if dt_union is None:
+            dt_union = self._sorted_union([c.dt_labels for c in self.components])
+        if mz_union is None:
+            mz_union = self._sorted_union([c.mz_labels for c in self.components])
+
+        self.t_labels = t_union.astype(float, copy=False)
+        self.rt_labels = rt_union.astype(float, copy=False)
+        self.dt_labels = dt_union.astype(float, copy=False)
+        self.mz_labels = mz_union.astype(float, copy=False)
+
+    @staticmethod
+    def _sorted_union(arrays: Sequence[np.ndarray]) -> np.ndarray:
+        """Sorted unique union (float-preserving)."""
+        u = np.array([], dtype=float)
+        for a in arrays:
+            u = np.union1d(u, np.asarray(a, dtype=float))
+        return u
+
+    @staticmethod
+    def _index_map(union: np.ndarray, vals: np.ndarray, *, axis_name: str) -> np.ndarray:
+        """
+        Map `vals` (subset) into indices of `union` by exact matching.
+        Raises if a value is not found. This assumes discretizations are preserved
+        so shared elements are numerically identical.
+        """
+        # dict mapping for O(n) with exact float keys (safe under preserved discretization)
+        lut: Dict[float, int] = {float(v): int(i) for i, v in enumerate(union)}
+        try:
+            idx = np.fromiter((lut[float(v)] for v in vals), count=vals.size, dtype=int)
+        except KeyError as e:
+            missing = float(e.args[0])
+            raise ValueError(f"Value {missing} from {axis_name} not present in union axis. "
+                             f"Axis alignment requires exact shared labels.") from None
+        return idx

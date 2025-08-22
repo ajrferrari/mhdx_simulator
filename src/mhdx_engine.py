@@ -364,10 +364,21 @@ class HDXTimecourseEngine:
         if rtn:
             return noisy
     
+    @staticmethod
+    def _meta_array(meta: dict) -> np.ndarray:
+        """
+        Store meta as a 1-element *unicode* array (dtype='U') to avoid
+        object dtype → pickle on load.
+        """
+        import json
+        import numpy as np
+        return np.array([json.dumps(meta)], dtype="U")
+    
+    
     def save_npz(self, path: str) -> None:
         """
         Save engine state (parameters, axes, and any computed tensors) to a single .npz.
-
+    
         Always saved
         ------------
         - timepoints, ks
@@ -376,12 +387,17 @@ class HDXTimecourseEngine:
         - rt_mean_arr, rt_std_arr, dt_mean_arr, dt_std_arr
         - tics (empty array if None)
         - meta_json (engine/scalar params, sequence, charge, steps)
-
+    
         Saved if available
         ------------------
         - rt_labels, dt_labels, mz_labels (empty arrays if not generated)
         - ideal_tensor, perturbed_tensor, noisy_tensor
         """
+        import numpy as np
+    
+        # if you already have SEC_PER_MIN in scope
+        RT_STEP_MIN = 1.0 / SEC_PER_MIN
+    
         meta = dict(
             engine_version=1,
             sequence=self.sequence,
@@ -398,7 +414,7 @@ class HDXTimecourseEngine:
             dt_step_ms=float(DT_STEP_MS),
             rt_step_min=float(RT_STEP_MIN),
         )
-
+    
         payload = {
             "timepoints": self.timepoints.astype(float, copy=False),
             "ks":         self.ks.astype(float, copy=False),
@@ -411,13 +427,14 @@ class HDXTimecourseEngine:
             "dt_std_arr":  np.asarray(self.dt_std_arr, dtype=float),
             "tics":        (np.array([], dtype=float) if self.tics is None
                             else np.asarray(self.tics, dtype=float)),
-            "meta_json":   np.array([json.dumps(meta)], dtype=object),
+            # >>> changed line: use unicode array instead of object array
+            "meta_json":   self._meta_array(meta),
             # axes (empty arrays if not present)
             "rt_labels": (np.array([], dtype=float) if self.rt_labels is None else self.rt_labels),
             "dt_labels": (np.array([], dtype=float) if self.dt_labels is None else self.dt_labels),
             "mz_labels": (np.array([], dtype=float) if self.mz_labels is None else self.mz_labels),
         }
-
+    
         # tensors (only if present)
         if self.ideal_tensor is not None:
             payload["ideal_tensor"] = self.ideal_tensor
@@ -425,9 +442,9 @@ class HDXTimecourseEngine:
             payload["perturbed_tensor"] = self.perturbed_tensor
         if self.noisy_tensor is not None:
             payload["noisy_tensor"] = self.noisy_tensor
-
+    
         np.savez_compressed(path, **payload)
-
+        
     @classmethod
     def load_npz(cls, path: str) -> "HDXTimecourseEngine":
         """

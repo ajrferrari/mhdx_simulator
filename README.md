@@ -1,6 +1,6 @@
 # mHDX Simulation Notebooks
 
-This repository provides a compact, end‑to‑end workflow to (i) quantify empirical variability from HDX‑MS libraries, (ii) sample realistic perturbations from those distributions, (iii) simulate 4‑D HDX tensors (Time × RT × DT × m/z), and (iv) combine signals across experiments.
+This repository provides a compact, end‑to‑end workflow to (i) quantify empirical variability from mHDX‑MS libraries, (ii) sample realistic perturbations from those distributions, (iii) simulate 4‑D HDX tensors (Time × RT × DT × m/z), and (iv) combine signals across experiments.
 
 > **Precomputed data**
 > We provide ready‑made outputs so you can skip heavy processing: copy the `datasets/` folder (see link below) into the **repository root** after cloning.
